@@ -30,6 +30,33 @@ python gemini_web2api.py
 
 Server starts at `http://localhost:8081/v1`.
 
+## GitHub Actions: keep server running + cloudflared
+
+This repo includes `/home/runner/work/gemini-web2api-actions/gemini-web2api-actions/.github/workflows/run-live-server.yml`, a manual workflow that:
+
+- installs only the essentials (`python`, `pip`, `httpx`)
+- starts `gemini_web2api.py`
+- optionally exposes it through `cloudflared`
+- keeps running until you cancel the workflow
+
+### Run it
+
+1. Open **Actions** → **Run Live Gemini Web2API Server**.
+2. Click **Run workflow**.
+3. Check the **Step Summary** for endpoints (`Local`, `Cloudflared`, and optional `Worker Proxy`).
+4. Cancel the workflow when you want to stop the server.
+
+### Optional secrets
+
+- `GEMINI_API_KEYS`: comma-separated keys (example: `sk-one,sk-two`)
+- `GEMINI_COOKIE`: cookie line for authenticated Gemini Web requests
+- `CLOUDFLARED_TUNNEL_TOKEN`: use a named tunnel instead of a temporary `trycloudflare.com` URL
+
+### Cloudflare Worker reverse proxy
+
+If you already use a Cloudflare Worker domain, set the workflow input `cloudflare_worker_url` (example: `https://api.example.com`).  
+The workflow will show `https://api.example.com/v1` in summary so your clients can use a stable endpoint while cloudflared handles the origin tunnel.
+
 ## Client Configuration
 
 ### Cherry Studio / ChatBox / any OpenAI client

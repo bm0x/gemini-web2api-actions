@@ -1,0 +1,174 @@
+name: Run Live Gemini Web2API Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      port:
+        description: "Puerto local del servidor"
+        required: false
+        default: "8081"
+      public_access:
+        description: "Exponer API con cloudflared"
+        required: false
+        type: boolean
+        default: true
+      cloudflare_worker_url:
+        description: "URL base opcional de tu Worker (ej: https://api.tudominio.com)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-gemini-web2api
+  cancel-in-progress: false
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PORT: ${{ inputs.port }}
+      PUBLIC_ACCESS: ${{ inputs.public_access }}
+      WORKER_PROXY_URL: ${{ inputs.cloudflare_worker_url }}
+      API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+      GEMINI_COOKIE: ${{ secrets.GEMINI_COOKIE }}
+      CLOUDFLARED_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARED_TUNNEL_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install minimal dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install cloudflared
+        if: ${{ inputs.public_access }}
+        run: |
+          curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Start API server and keep workflow alive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd "$GITHUB_WORKSPACE"
+
+          python - <<'PY'
+          import json
+          import os
+
+          with open('config.example.json', 'r', encoding='utf-8') as f:
+              cfg = json.load(f)
+
+          cfg['port'] = int(os.environ['PORT'])
+          cfg['host'] = '0.0.0.0'
+
+          api_keys = [k.strip() for k in os.environ.get('API_KEYS', '').split(',') if k.strip()]
+          cfg['api_keys'] = api_keys
+
+          cookie = os.environ.get('GEMINI_COOKIE', '').strip()
+          if cookie:
+              with open('cookie.txt', 'w', encoding='utf-8') as f:
+                  f.write(cookie)
+              cfg['cookie_file'] = os.path.join(os.environ['GITHUB_WORKSPACE'], 'cookie.txt')
+
+          with open('config.json', 'w', encoding='utf-8') as f:
+              json.dump(cfg, f, ensure_ascii=False, indent=2)
+          PY
+
+          python gemini_web2api.py > /tmp/gemini-web2api.log 2>&1 &
+          SERVER_PID=$!
+          TUNNEL_PID=""
+          TUNNEL_URL=""
+
+          cleanup() {
+            set +e
+            if [[ -n "$TUNNEL_PID" ]]; then
+              kill "$TUNNEL_PID" 2>/dev/null || true
+            fi
+            kill "$SERVER_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT INT TERM
+
+          for _ in {1..40}; do
+            status_code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/v1/models" || true)"
+            if [[ "$status_code" == "200" || "$status_code" == "401" ]]; then
+              break
+            fi
+            sleep 2
+          done
+
+          if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "❌ El servidor se cerró durante el arranque"
+            tail -n 200 /tmp/gemini-web2api.log || true
+            exit 1
+          fi
+
+          if [[ "$PUBLIC_ACCESS" == "true" ]]; then
+            if [[ -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" ]]; then
+              cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARED_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+              TUNNEL_PID=$!
+              TUNNEL_URL="(named tunnel con hostname configurado en Cloudflare)"
+            else
+              cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:${PORT}" > /tmp/cloudflared.log 2>&1 &
+              TUNNEL_PID=$!
+
+              for _ in {1..40}; do
+                if grep -Eo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared.log >/tmp/cloudflared-url.log 2>/dev/null; then
+                  TUNNEL_URL="$(head -n 1 /tmp/cloudflared-url.log)"
+                  break
+                fi
+                if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+                  echo "❌ cloudflared se cerró durante el arranque"
+                  tail -n 200 /tmp/cloudflared.log || true
+                  exit 1
+                fi
+                sleep 2
+              done
+            fi
+          fi
+
+          {
+            echo "## ✅ Gemini Web2API iniciado"
+            echo ""
+            echo "- Local: http://127.0.0.1:${PORT}/v1"
+            if [[ -n "$TUNNEL_URL" ]]; then
+              echo "- Cloudflared: ${TUNNEL_URL}/v1"
+            fi
+            if [[ -n "${WORKER_PROXY_URL:-}" ]]; then
+              echo "- Worker Proxy: ${WORKER_PROXY_URL%/}/v1"
+            fi
+            echo ""
+            echo "Cancela manualmente este workflow cuando quieras detener el servidor."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Server PID: $SERVER_PID"
+          if [[ -n "$TUNNEL_PID" ]]; then
+            echo "Cloudflared PID: $TUNNEL_PID"
+          fi
+
+          while true; do
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "❌ El servidor principal se detuvo"
+              tail -n 200 /tmp/gemini-web2api.log || true
+              exit 1
+            fi
+
+            if [[ -n "$TUNNEL_PID" ]] && ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+              echo "❌ cloudflared se detuvo"
+              tail -n 200 /tmp/cloudflared.log || true
+              exit 1
+            fi
+
+            sleep 15
+          done
