@@ -90,6 +90,43 @@ jobs:
           SERVER_PID=$!
           TUNNEL_PID=""
           TUNNEL_URL=""
+          TUNNEL_URL_DETECTION_TIMEOUT=180
+
+          extract_cloudflared_url() {
+            python - <<'PY'
+            import re
+            from pathlib import Path
+
+            log_path = Path("/tmp/cloudflared.log")
+            if not log_path.exists():
+                raise SystemExit(0)
+
+            data = log_path.read_text(encoding="utf-8", errors="ignore")
+
+            quick = re.search(r"https://[-a-z0-9]+\.trycloudflare\.com", data)
+            if quick:
+                print(quick.group(0))
+                raise SystemExit(0)
+
+            for pattern in (
+                r'"hostname":"([^"]+)"',
+                r'\\"hostname\\":\\"([^\\"]+)\\"',
+                r"hostname=([A-Za-z0-9.-]+\.[A-Za-z]{2,})",
+            ):
+                match = re.search(pattern, data)
+                if match:
+                    hostname = match.group(1).strip()
+                    if hostname and hostname not in {"localhost", "127.0.0.1"}:
+                        print(f"https://{hostname}")
+                        raise SystemExit(0)
+
+            for url in re.findall(r"https://[A-Za-z0-9.-]+", data):
+                if any(blocked in url for blocked in ("developers.cloudflare.com", "github.com", "localhost", "127.0.0.1")):
+                    continue
+                print(url)
+                raise SystemExit(0)
+            PY
+          }
 
           cleanup() {
             set +e
@@ -118,24 +155,23 @@ jobs:
             if [[ -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" ]]; then
               cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARED_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
               TUNNEL_PID=$!
-              TUNNEL_URL="(named tunnel con hostname configurado en Cloudflare)"
             else
               cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:${PORT}" > /tmp/cloudflared.log 2>&1 &
               TUNNEL_PID=$!
-
-              for _ in {1..40}; do
-                if grep -Eo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared.log >/tmp/cloudflared-url.log 2>/dev/null; then
-                  TUNNEL_URL="$(head -n 1 /tmp/cloudflared-url.log)"
-                  break
-                fi
-                if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-                  echo "❌ cloudflared se cerró durante el arranque"
-                  tail -n 200 /tmp/cloudflared.log || true
-                  exit 1
-                fi
-                sleep 2
-              done
             fi
+
+            for _ in $(seq 1 $((TUNNEL_URL_DETECTION_TIMEOUT / 2))); do
+              TUNNEL_URL="$(extract_cloudflared_url || true)"
+              if [[ -n "$TUNNEL_URL" ]]; then
+                break
+              fi
+              if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+                echo "❌ cloudflared se cerró durante el arranque"
+                tail -n 200 /tmp/cloudflared.log || true
+                exit 1
+              fi
+              sleep 2
+            done
           fi
 
           {
@@ -143,7 +179,9 @@ jobs:
             echo ""
             echo "- Local: http://127.0.0.1:${PORT}/v1"
             if [[ -n "$TUNNEL_URL" ]]; then
-              echo "- Cloudflared: ${TUNNEL_URL}/v1"
+              echo "- Cloudflared: ${TUNNEL_URL%/}/v1"
+            elif [[ "$PUBLIC_ACCESS" == "true" ]]; then
+              echo "- Cloudflared: URL no detectada automáticamente (revisa el log de cloudflared en el job)"
             fi
             if [[ -n "${WORKER_PROXY_URL:-}" ]]; then
               echo "- Worker Proxy: ${WORKER_PROXY_URL%/}/v1"
